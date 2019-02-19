@@ -16,6 +16,13 @@ from redminelib import Redmine
 from io import BytesIO
 
 
+class MessageContentTypeError(Exception):
+    """Exception raised for errors in the message content type"""
+
+    def __init__(self, message):
+        self.message = message
+
+
 class EmailClient:
     """
     Email client for POP3 server. Can retrieve and delete messages.
@@ -179,6 +186,9 @@ class EmailClient:
         :param EmailMessage msg: Email message
         :return List[Dict]:
         """
+        content_type = msg.get_content_type()
+        if content_type == 'multipart/report':
+            raise MessageContentTypeError(message='Message is report')
         if msg.is_multipart():
             parts = []
             for part in msg.get_payload():
@@ -186,7 +196,6 @@ class EmailClient:
             return parts
         else:
             content = msg.get_payload(decode=True)
-            content_type = msg.get_content_type().lower()
             if content_type == 'text/html':
                 # Convert html to plain text using BeautifulSoup module
                 soup = BeautifulSoup(content, 'html.parser')
@@ -196,6 +205,8 @@ class EmailClient:
                 return [{'type': 'text', 'body': soup.get_text()}]
             elif content_type == 'text/plain':
                 charset = self.get_message_charset(msg)
+                if not charset:
+                    return []
                 return [{'type': 'text', 'body': content.decode(charset)}]
             elif content_type.startswith('image') or content_type.startswith('application'):
                 return [{'type': 'file', 'filename': msg.get_filename(), 'body': content}]
@@ -232,11 +243,12 @@ if __name__ == '__main__':
     parser.add_argument('-port', default=110, help='server port (default: 110)')
     parser.add_argument('-username', required=True, help='username (example: user@doman.test)')
     parser.add_argument('-password', required=True, help='password')
+    parser.add_argument('-redmine_url', required=True, help='Redmine URL')
     parser.add_argument('-redmine_api_key', required=True, help='Redmine API key')
     parser.add_argument('-project_id', required=True, help='Redmine project ID')
     parser.add_argument('-user_id', required=True, help='User or group id to assign issue to')
     args = parser.parse_args()
-    redmine = Redmine('http://srv-redmine-test.arsenal.plm', key=args.redmine_api_key)
+    redmine = Redmine(args.redmine_url, key=args.redmine_api_key)
     with EmailClient(server=args.server, port=args.port, username=args.username, password=args.password) as client:
         message_list = client.get_message_list()
         for index in range(len(message_list)):
@@ -264,12 +276,14 @@ if __name__ == '__main__':
                         },
                         {
                             'id': 65,
-                            'value': 'Приём и регистрация заявки(4ч.)'
+                            'value': 'Приём и регистрация заявки(1ч.)'
                         }
                     ],
                     uploads=uploads
                 )
                 client.delete_message(message_index)
 
+            except MessageContentTypeError:
+                pass
             except Exception as e:
                 print(e)
