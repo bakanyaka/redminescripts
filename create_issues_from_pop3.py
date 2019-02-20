@@ -147,7 +147,13 @@ class EmailClient:
             'subject': subject
         }
 
-    def get_message_body(self, msg: EmailMessage) -> List[Dict]:
+    def get_message_body(self, msg: EmailMessage) -> str:
+        """
+        Finds best candidate for display as 'body' of message and returns it in plain teext
+
+        :param EmailMessage msg:
+        :return str:
+        """
         body = msg.get_body()
         parsed_body = ''
         content_type = body.get_content_type()
@@ -159,10 +165,15 @@ class EmailClient:
                 if part.get_content_maintype() == 'text':
                     return self.parse_message_body(part)
         else:
-            print(content_type)
+            logging.DEBUG(content_type)
         return parsed_body
 
-    def parse_message_body(self, msg: EmailMessage):
+    def parse_message_body(self, msg: EmailMessage) -> str:
+        """
+        Decode and transforms message body to plain text
+        :param msg:
+        :return:
+        """
         content_type = msg.get_content_type()
         if content_type == 'text/html':
             content = msg.get_payload(decode=True)
@@ -182,7 +193,12 @@ class EmailClient:
             raise Exception('Unknown text content type')
         return body
 
-    def get_attachments(self, msg: EmailMessage):
+    def get_attachments(self, msg: EmailMessage) -> List:
+        """
+        Get a list of all message attachments
+        :param EmailMessage msg:
+        :return List:
+        """
         attachments = []
         for attachment in msg.iter_attachments():
             content = attachment.get_payload(decode=True)
