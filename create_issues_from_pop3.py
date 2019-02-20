@@ -3,24 +3,19 @@ Script for connect to mailbox via POP3 and creating redmine issues bases on inbo
 """
 
 import argparse
+import email
+import logging
 import poplib
 import re
-from email.header import decode_header
 from email.message import EmailMessage
-from email.parser import Parser
+from email.parser import BytesParser
+from email.policy import EmailPolicy
+from io import BytesIO
 from poplib import POP3
 from typing import List, Dict
 
 from bs4 import BeautifulSoup
 from redminelib import Redmine
-from io import BytesIO
-
-
-class MessageContentTypeError(Exception):
-    """Exception raised for errors in the message content type"""
-
-    def __init__(self, message):
-        self.message = message
 
 
 class EmailClient:
@@ -110,26 +105,20 @@ class EmailClient:
         :return Dict: Message as dictionary
         """
         (resp_message, lines, octets) = self.server_connection.retr(message_index)
-        msg_content = b'\r\n'.join(lines).decode('utf-8')
-        msg = Parser().parsestr(msg_content)  # Create email.message.EmailMessage from message string
-        headers = self.parse_message_headers(msg)
-        mail_body_parts = self.parse_message_body(msg)
-
-        body = []
-        attachments = []
-        for part in mail_body_parts:
-            if part['type'] == 'text':
-                body.append(part['body'])
-            elif part['type'] == 'file':
-                attachments.append(part)
+        msg_content = b'\n'.join(lines)
+        msg = BytesParser(EmailMessage, policy=email.policy.default).parsebytes(
+            msg_content)  # Create email.message.EmailMessage from message string
+        headers = self.get_message_headers(msg)
+        body = self.get_message_body(msg)
+        attachments = self.get_attachments(msg)
 
         return {
             **headers,
-            'body': '\n'.join(body),
+            'body': body,
             'attachments': attachments,
         }
 
-    def parse_message_headers(self, msg: EmailMessage) -> Dict:
+    def get_message_headers(self, msg: EmailMessage) -> Dict:
         """
         Decodes and parses message headers
         https://docs.python.org/3/library/email.message.html#email.message.EmailMessage
@@ -137,81 +126,69 @@ class EmailClient:
         :param EmailMessage msg: (required) Email message
         :return Dict: Message headers
         """
-        email_regexp = r'[\w\.-]+@[\w\.-]+'
-        decoded_from = decode_header(msg.get('From'))  # Decode from base64. Returns a list of (string, charset) pairs.
-        if len(decoded_from) == 1:
-            # Only email address in from field
-            match = re.findall(email_regexp, decoded_from[0][0])
-            from_email = match[0] if match else ''
-            from_name = ''
-        elif len(decoded_from) == 2:
-            # Both address and name in from field
-            (from_name_raw, encoding) = decoded_from[0]
-            from_name = from_name_raw if encoding is None else from_name_raw.decode(encoding)
-            match = re.findall(email_regexp, decoded_from[1][0].decode())
-            from_email = match[0] if match else ''
-        else:
-            raise Exception('Incorrect from header')
+        email_regexp = r'(?:(.+?)\s<)?([\w.-]+@[\w.-]+)'
+        from_name, from_email = re.findall(email_regexp, msg.get('From'))[0]
 
-        decoded_to = decode_header(msg.get('To'))  # Decode from base64. Returns a list of (string, charset) pairs.
-        if len(decoded_to) == 1:
-            # Only email address in to field
-            match = re.findall(email_regexp, decoded_to[0][0])
-            to_email = match[0] if match else ''
-            to_name = ''
-        elif len(decoded_to) == 2:
-            # Both address and name in to field
-            (to_name_raw, encoding) = decoded_to[0]
-            to_name = to_name_raw if encoding is None else to_name_raw.decode(encoding)
-            match = re.findall(email_regexp, decoded_to[1][0].decode())
-            to_email = match[0] if match else ''
-        else:
-            raise Exception('Incorrect to header')
-
-        header_subject = msg.get('Subject')
-        subject_raw, encoding = decode_header(header_subject)[0]  # Decode from base64
-        subject = subject_raw if encoding is None else subject_raw.decode(encoding)
+        # To field can contain multiple recipients separated by comma
+        # we split it before decoding because it hard to separate decode_header() result
+        raw_to = msg.get('To').split(',')
+        recipients = []
+        for recipient in raw_to:
+            match = re.findall(email_regexp, recipient)
+            if match:
+                recipients.append({'name': match[0][0], 'email': match[0][1]})
+        subject = msg.get('Subject')
         return {
-            'from_email': from_email,
-            'from_name': from_name,
-            'to_email': to_email,
-            'to_name': to_name,
+            'sender': {
+                'name': from_name,
+                'email': from_email
+            },
+            'recipients': recipients,
             'subject': subject
         }
 
-    def parse_message_body(self, msg: EmailMessage) -> List[Dict]:
-        """
-        Decodes and parses all parts of message
-        https://docs.python.org/3/library/email.message.html#email.message.EmailMessage
-        :param EmailMessage msg: Email message
-        :return List[Dict]:
-        """
-        content_type = msg.get_content_type()
-        if content_type == 'multipart/report':
-            raise MessageContentTypeError(message='Message is report')
-        if msg.is_multipart():
-            parts = []
-            for part in msg.get_payload():
-                parts += self.parse_message_body(part)
-            return parts
+    def get_message_body(self, msg: EmailMessage) -> List[Dict]:
+        body = msg.get_body()
+        parsed_body = ''
+        content_type = body.get_content_type()
+        main_content_type = body.get_content_maintype()
+        if main_content_type == 'text':
+            parsed_body = self.parse_message_body(body)
+        elif content_type == 'multipart/related':
+            for part in body.iter_parts():
+                if part.get_content_maintype() == 'text':
+                    return self.parse_message_body(part)
         else:
+            print(content_type)
+        return parsed_body
+
+    def parse_message_body(self, msg: EmailMessage):
+        content_type = msg.get_content_type()
+        if content_type == 'text/html':
             content = msg.get_payload(decode=True)
-            if content_type == 'text/html':
-                # Convert html to plain text using BeautifulSoup module
-                soup = BeautifulSoup(content, 'html.parser')
-                # Remove style tags because soup.get_text() leaves traces of them
-                for tag in soup.find_all('style'):
-                    tag.decompose()
-                return [{'type': 'text', 'body': soup.get_text()}]
-            elif content_type == 'text/plain':
-                charset = self.get_message_charset(msg)
-                if not charset:
-                    return []
-                return [{'type': 'text', 'body': content.decode(charset)}]
-            elif content_type.startswith('image') or content_type.startswith('application'):
-                return [{'type': 'file', 'filename': msg.get_filename(), 'body': content}]
-            else:
-                raise Exception(f'Unknown content type {content_type}')
+            # Convert html to plain text using BeautifulSoup module
+            soup = BeautifulSoup(content, 'html.parser')
+            # Remove style tags because soup.get_text() leaves traces of them
+            for tag in soup.find_all('style'):
+                tag.decompose()
+            body = soup.get_text()
+        elif content_type == 'text/plain':
+            content = msg.get_payload(decode=True)
+            charset = self.get_message_charset(msg)
+            if not charset:
+                return []
+            body = content.decode(charset)
+        else:
+            raise Exception('Unknown text content type')
+        return body
+
+    def get_attachments(self, msg: EmailMessage):
+        attachments = []
+        for attachment in msg.iter_attachments():
+            content = attachment.get_payload(decode=True)
+            attachments.append(
+                {'type': attachment.get_content_type(), 'filename': attachment.get_filename(), 'body': content})
+        return attachments
 
     def get_message_charset(self, msg: EmailMessage) -> str:
         """
@@ -237,6 +214,9 @@ class EmailClient:
 
 
 if __name__ == '__main__':
+    logging.basicConfig(filename='create_issues_from_pop3.log', filemode='a',
+                        format='%(asctime)s - %(message)s',
+                        level=logging.DEBUG)
     parser = argparse.ArgumentParser(
         description='Connect to mailbox via POP3 and create redmine issues bases on messages.')
     parser.add_argument('-server', default='localhost', help='server name (default: localhost)')
@@ -262,7 +242,7 @@ if __name__ == '__main__':
                 phone = f' ({match.group(1)})' if match else ''
                 issue = redmine.issue.create(
                     project_id=args.project_id,
-                    subject=f'{message["from_name"] or message["from_email"]}: {message["subject"]}{phone}',
+                    subject=f'{message["sender"]["name"] or message["sender"]["email"]}: {message["subject"]}{phone}',
                     assigned_to_id=args.user_id,
                     description=message['body'],
                     custom_fields=[
@@ -282,8 +262,5 @@ if __name__ == '__main__':
                     uploads=uploads
                 )
                 client.delete_message(message_index)
-
-            except MessageContentTypeError:
-                pass
             except Exception as e:
-                print(e)
+                logging.exception(f'Exception "{e}" occurred')
